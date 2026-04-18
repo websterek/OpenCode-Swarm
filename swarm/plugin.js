@@ -19,7 +19,7 @@ const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_DIR = join(PLUGIN_DIR, ".swarm");
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers — general
 // ---------------------------------------------------------------------------
 
 async function readProjectFile(dir, relPath) {
@@ -59,8 +59,6 @@ function extractSection(content, sectionName) {
 }
 
 // Extract the system prompt from an agent .md file.
-// Prefers a fenced block under "## System Prompt", then plain text under that
-// heading, then falls back to everything after the frontmatter.
 function extractSystemPrompt(content) {
   const fenced = content.match(
     /##\s+System Prompt\s*\n```[^\n]*\n([\s\S]*?)```/,
@@ -179,6 +177,171 @@ async function collectFiles(dir, base = dir) {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers — run history
+//
+// Every tool invocation that produces output writes into a timestamped run
+// directory:
+//
+//   .swarm/output/runs/<runId>/plan/        ← swarm_debate writes here
+//   .swarm/output/runs/<runId>/build/       ← swarm_build_run writes here
+//   .swarm/output/runs/<runId>/review/      ← swarm_review_run writes here
+//
+// After writing, the "current" files are also updated so the orchestrating
+// agents can always reference stable paths:
+//
+//   .swarm/output/plan/consensus.md         ← copy of latest run's consensus
+//   .swarm/output/plan/debate_log.md        ← copy of latest run's debate log
+//   .swarm/output/build/build_log.md        ← copy of latest run's build log
+//   .swarm/output/review/review_report.md   ← copy of latest run's report
+//
+// meta.json in each run directory records structured metadata about the run
+// for future tooling (swarm_status, swarm_resume, etc.).
+// ---------------------------------------------------------------------------
+
+// Generate a filesystem-safe timestamp string: YYYY-MM-DD_HH-MM-SS
+function makeRunId() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`
+  );
+}
+
+// Ensure a run directory exists and return its absolute path.
+async function ensureRunDir(projectDir, runId, phase) {
+  const runDir = join(projectDir, ".swarm/output/runs", runId, phase);
+  await mkdir(runDir, { recursive: true });
+  return runDir;
+}
+
+// Write (or merge-update) the meta.json for a run/phase.
+// Existing keys are preserved; new keys from `patch` are merged in.
+async function writeMeta(runDir, patch) {
+  const metaPath = join(runDir, "meta.json");
+  let existing = {};
+  try {
+    existing = JSON.parse(await readFile(metaPath, "utf8"));
+  } catch {
+    // file doesn't exist yet — start fresh
+  }
+  await writeFile(
+    metaPath,
+    JSON.stringify({ ...existing, ...patch }, null, 2),
+    "utf8",
+  );
+}
+
+// Copy a file from the run directory to the "current" output directory,
+// creating the destination directory as needed.
+async function publishCurrent(src, projectDir, currentRelPath) {
+  const dest = join(projectDir, ".swarm", currentRelPath);
+  await mkdir(dirname(dest), { recursive: true });
+  await cp(src, dest, { force: true });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — context compression
+//
+// After each debate round, instead of passing the raw full text of every
+// agent's output to the next round (which blows up context), we run a
+// compression step: a single LLM call that distills what each agent said,
+// what they voted, and what specific changes they requested.
+//
+// The compression prompt is read from the "## Compress Prompt" section in
+// plan.md so it is user-editable. If that section is absent, a built-in
+// default is used.
+//
+// Template variables available in the compress prompt:
+//   {{round}}           — round number just completed
+//   {{agent_summaries}} — one block per agent: name, self-vote, full output
+//   {{cross_votes}}     — JSON of crossVotes
+// ---------------------------------------------------------------------------
+
+const DEFAULT_COMPRESS_PROMPT = `\
+You are a debate summariser. A multi-agent planning debate just completed round {{round}}.
+Below are each agent's output and how they voted on each other.
+
+{{agent_summaries}}
+
+Cross-review votes:
+{{cross_votes}}
+
+Write a concise summary (aim for under 400 words total) that captures:
+1. What each agent proposed (2-3 sentences each)
+2. What each agent objected to or asked to change (be specific — quote the exact requirement)
+3. The key open questions that must be resolved in the next round
+4. What all agents agreed on (do not repeat these in the next round)
+
+Format:
+### Agent Summaries
+<one paragraph per agent>
+
+### Revision Requests
+<bullet list of exact changes requested, labelled by which agent asked for them>
+
+### Open Questions
+<bullet list>
+
+### Agreed Points (skip in next round)
+<bullet list>
+`;
+
+async function compressContext(
+  client,
+  dir,
+  round,
+  agents,
+  agentOutputs,
+  selfVotes,
+  crossVotes,
+  compressTemplate,
+) {
+  const template = compressTemplate || DEFAULT_COMPRESS_PROMPT;
+
+  const agentSummaries = agents
+    .map(
+      (a) =>
+        `=== ${a.name} (self-vote: ${selfVotes[a.name]}) ===\n` +
+        (agentOutputs[a.name] ?? "(no output)"),
+    )
+    .join("\n\n");
+
+  const prompt = fillTemplate(template, {
+    round: String(round),
+    agent_summaries: agentSummaries,
+    cross_votes: JSON.stringify(crossVotes, null, 2),
+  });
+
+  try {
+    const compressed = await runSession(
+      client,
+      dir,
+      `Swarm Compress — Round ${round}`,
+      // Neutral system prompt — the compression step is orchestrator-level,
+      // not tied to any specific agent's perspective.
+      "You are a neutral debate summariser. Be concise and specific.",
+      prompt,
+    );
+    return compressed.trim();
+  } catch (err) {
+    // Compression is best-effort. If it fails, fall back to a minimal
+    // hand-crafted summary so the debate can continue.
+    console.error(
+      `[swarm_debate] Compression failed (round ${round}): ${err.message}`,
+    );
+    return agents
+      .map(
+        (a) =>
+          `${a.name} voted ${selfVotes[a.name]}.\n` +
+          // Keep only the last 500 chars of each output as a fallback
+          (agentOutputs[a.name] ?? "").slice(-500),
+      )
+      .join("\n\n---\n\n");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -209,7 +372,7 @@ export const server = async (input) => {
       config.agent["swarm-plan"] = {
         mode: "primary",
         description: "Multi-agent debate → consensus.md",
-        maxSteps: 30,
+        maxSteps: 40,
         permission: { edit: "allow", bash: "allow" },
         prompt:
           "You are the Swarm Plan Orchestrator. " +
@@ -217,9 +380,9 @@ export const server = async (input) => {
           "When the user describes a project, run the debate loop: " +
           "call swarm_debate with round=1 and the user's message as brief. " +
           "After each call check unanimous. If false, call swarm_debate again " +
-          "with round+1 and the returned context. If true, report that " +
-          "consensus.md has been written. If escalate is true, summarise the " +
-          "disagreements and ask the user to decide.",
+          "with round+1, the returned context, and the returned runId. " +
+          "If true, report that consensus.md has been written and show the runId. " +
+          "If escalate is true, summarise the disagreements and ask the user to decide.",
         // Spread user overrides on top so config.json can still pin a model
         // or change any field without touching this file.
         ...config.agent["swarm-plan"],
@@ -236,7 +399,8 @@ export const server = async (input) => {
           "Your detailed instructions are in the system prompt below. " +
           "Read .swarm/output/plan/consensus.md to understand the approved plan. " +
           "Break it into logical implementation steps and call swarm_build_run " +
-          "once per step, in order. After all steps, summarise what was built.",
+          "once per step, in order. Pass the same runId to every swarm_build_run call " +
+          "so all steps are grouped in one run. After all steps, summarise what was built.",
         ...config.agent["swarm-build"],
       };
 
@@ -268,10 +432,10 @@ export const server = async (input) => {
       };
 
       // -- /swarm_init command ----------------------------------------------
-      // Only register if the user hasn't already defined their own version.
       if (!config.command["swarm_init"]) {
         config.command["swarm_init"] = {
-          description: "Set up .swarm/ in this project (copies the default template)",
+          description:
+            "Set up .swarm/ in this project (copies the default template)",
           agent: "swarm-init",
           template:
             "Initialise this project with the Swarm setup. " +
@@ -283,25 +447,27 @@ export const server = async (input) => {
     // -----------------------------------------------------------------------
     // Inject the ## Orchestrator section from the relevant mode file into the
     // orchestrator's system prompt at session start.
-    // This means editing .swarm/plan.md (or build.md / review.md) changes
-    // orchestrator behaviour immediately with no code changes required.
     // -----------------------------------------------------------------------
     "experimental.chat.system.transform": async (_input, output) => {
       const systemText = output.system.join("\n");
 
-      // Only act on swarm orchestrator sessions
-      if (!systemText.includes("Swarm") || !systemText.includes("Orchestrator")) {
+      if (
+        !systemText.includes("Swarm") ||
+        !systemText.includes("Orchestrator")
+      ) {
         return;
       }
 
       let modeFile = null;
-      if (systemText.includes("Swarm Plan Orchestrator"))    modeFile = ".swarm/plan.md";
-      else if (systemText.includes("Swarm Build Orchestrator")) modeFile = ".swarm/build.md";
-      else if (systemText.includes("Swarm Review Orchestrator")) modeFile = ".swarm/review.md";
+      if (systemText.includes("Swarm Plan Orchestrator"))
+        modeFile = ".swarm/plan.md";
+      else if (systemText.includes("Swarm Build Orchestrator"))
+        modeFile = ".swarm/build.md";
+      else if (systemText.includes("Swarm Review Orchestrator"))
+        modeFile = ".swarm/review.md";
 
       if (!modeFile) return;
 
-      // The hook doesn't expose the project directory directly — ask the client.
       let projectDir = null;
       try {
         const proj = await client.project.current({});
@@ -329,11 +495,6 @@ export const server = async (input) => {
     tool: {
       // ---------------------------------------------------------------------
       // swarm_init
-      //
-      // Copies the default .swarm/ template from the plugin directory into
-      // the current project. Safe to customise the template at:
-      //   ~/.config/opencode/swarm/.swarm/
-      // Those edits become the new default for every future /swarm_init call.
       // ---------------------------------------------------------------------
       swarm_init: tool({
         description:
@@ -352,7 +513,6 @@ export const server = async (input) => {
           const force = args.force ?? false;
           ctx.metadata({ title: "Swarm Init" });
 
-          // Verify the template directory exists next to this plugin file
           try {
             await stat(TEMPLATE_DIR);
           } catch {
@@ -363,12 +523,13 @@ export const server = async (input) => {
             });
           }
 
-          // Collect every file in the template
           let templateFiles;
           try {
             templateFiles = await collectFiles(TEMPLATE_DIR);
           } catch (err) {
-            return JSON.stringify({ error: `Failed to read template: ${err.message}` });
+            return JSON.stringify({
+              error: `Failed to read template: ${err.message}`,
+            });
           }
 
           const created = [];
@@ -377,9 +538,8 @@ export const server = async (input) => {
 
           for (const relFile of templateFiles) {
             const dest = join(dir, ".swarm", relFile);
-            const src  = join(TEMPLATE_DIR, relFile);
+            const src = join(TEMPLATE_DIR, relFile);
 
-            // Check whether destination already exists
             let exists = false;
             try {
               await stat(dest);
@@ -402,22 +562,21 @@ export const server = async (input) => {
             }
           }
 
-          // Also ensure the output directories exist (they are not in the template
-          // because they are runtime-generated, but the agents need them to exist).
+          // Ensure runtime output directories exist (not in template).
           for (const outDir of [
             join(dir, ".swarm/output/plan"),
             join(dir, ".swarm/output/build"),
             join(dir, ".swarm/output/review"),
+            join(dir, ".swarm/output/runs"),
           ]) {
             try {
               await mkdir(outDir, { recursive: true });
             } catch {
-              // ignore
+              /* ignore */
             }
           }
 
           const lines = ["Swarm init complete.\n"];
-
           if (created.length > 0) {
             lines.push(`Created (${created.length}):`);
             created.forEach((f) => lines.push(`  + ${f}`));
@@ -429,16 +588,17 @@ export const server = async (input) => {
           }
           if (errors.length > 0) {
             lines.push(`\nErrors (${errors.length}):`);
-            errors.forEach(({ file, error }) => lines.push(`  ! ${file}: ${error}`));
+            errors.forEach(({ file, error }) =>
+              lines.push(`  ! ${file}: ${error}`),
+            );
           }
-
           lines.push(
             "\nNext steps:",
-            "  1. Switch to the \"Swarm - Plan\" agent",
+            '  1. Switch to the "Swarm - Plan" agent',
             "  2. Describe your project",
             "  3. The agents in .swarm/plan.md will debate until unanimous",
             "  4. Review .swarm/output/plan/consensus.md",
-            "  5. Switch to \"Swarm - Build\" to implement the plan",
+            '  5. Switch to "Swarm - Build" to implement the plan',
           );
 
           return JSON.stringify({
@@ -457,24 +617,31 @@ export const server = async (input) => {
       //
       // Phase 1 — Produce
       //   Every agent receives the Produce Prompt and writes their plan.
-      //   Each agent includes a self-vote (VOTE: APPROVE / VOTE: REVISE)
-      //   at the end of their output. This vote IS counted toward consensus.
+      //   Each agent self-votes (VOTE: APPROVE / VOTE: REVISE). Counted.
       //
       // Phase 2 — Cross-Review
-      //   Every agent reads every other agent's output and votes on it.
-      //   These votes are also counted.
+      //   Every agent reads every other agent's output and votes. Counted.
       //
-      // Unanimous means ALL votes from both phases are APPROVE.
+      // Phase 3 — Compress
+      //   A single LLM call distils all outputs + votes into a compact
+      //   summary that becomes the {{context}} for the next round. This
+      //   keeps the context window from growing linearly with rounds.
       //
-      // The orchestrator calls this repeatedly, incrementing round each time
-      // and passing back the context string, until unanimous === true.
+      // Run history:
+      //   All output is written to .swarm/output/runs/<runId>/plan/ and
+      //   also copied to .swarm/output/plan/ (current).
+      //   runId is generated on round 1 and returned so the orchestrator
+      //   can pass it back on subsequent rounds.
       // ---------------------------------------------------------------------
       swarm_debate: tool({
         description:
           "Run one round of the multi-agent planning debate. " +
-          "Each agent self-votes in Phase 1 and cross-votes in Phase 2. " +
+          "Phase 1: each agent produces a plan and self-votes. " +
+          "Phase 2: each agent cross-reviews all others. " +
+          "Phase 3: outputs are compressed into a compact context for the next round. " +
           "Unanimous requires every vote (both phases) to be APPROVE. " +
-          "Call repeatedly, incrementing round and passing back context, until unanimous is true.",
+          "On round 1 omit runId — a new one is generated. " +
+          "Pass the returned runId and context back on every subsequent call.",
         args: {
           round: tool.schema
             .number()
@@ -486,12 +653,22 @@ export const server = async (input) => {
             .string()
             .optional()
             .describe(
-              "The context string returned by the previous round. Omit on round 1.",
+              "Compressed context returned by the previous round. Omit on round 1.",
+            ),
+          runId: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Run ID returned by round 1. Pass it back on all subsequent rounds " +
+                "so all rounds belong to the same run directory.",
             ),
         },
         async execute(args, ctx) {
           const dir = ctx.directory;
           ctx.metadata({ title: `Swarm Plan — Round ${args.round}` });
+
+          // -- Resolve or create run ID ------------------------------------
+          const runId = args.runId ?? makeRunId();
 
           // -- Read mode file -----------------------------------------------
           const modeContent = await readProjectFile(dir, ".swarm/plan.md");
@@ -516,18 +693,32 @@ export const server = async (input) => {
 
           // -- Escalate if max rounds exceeded ------------------------------
           if (args.round > maxRounds) {
+            // Update meta for this run to record the escalation
+            const runDir = await ensureRunDir(dir, runId, "plan");
+            await writeMeta(runDir, {
+              outcome: "escalated",
+              roundsCompleted: args.round - 1,
+              updatedAt: new Date().toISOString(),
+            });
             return JSON.stringify({
+              runId,
               unanimous: false,
               escalate: true,
               message:
                 `Reached the maximum of ${maxRounds} rounds without unanimous agreement. ` +
-                "Review .swarm/output/plan/debate_log.md and decide.",
+                `Review .swarm/output/runs/${runId}/plan/debate_log.md and decide.`,
             });
           }
 
           // -- Validate required sections -----------------------------------
           const produceTemplate = extractSection(modeContent, "Produce Prompt");
-          const crossReviewTemplate = extractSection(modeContent, "Cross-Review Prompt");
+          const crossReviewTemplate = extractSection(
+            modeContent,
+            "Cross-Review Prompt",
+          );
+          // compressTemplate is optional — falls back to built-in default
+          const compressTemplate =
+            extractSection(modeContent, "Compress Prompt") || null;
 
           if (!produceTemplate) {
             return JSON.stringify({
@@ -562,19 +753,35 @@ export const server = async (input) => {
             });
           }
 
+          // -- Ensure run directory -----------------------------------------
+          const runDir = await ensureRunDir(dir, runId, "plan");
+
+          // Write/update meta at the start of the round
+          if (args.round === 1) {
+            await writeMeta(runDir, {
+              runId,
+              phase: "plan",
+              brief: args.brief,
+              agents: agents.map((a) => a.name),
+              maxRounds,
+              startedAt: new Date().toISOString(),
+              outcome: "in_progress",
+              roundsCompleted: 0,
+            });
+          }
+
           // -----------------------------------------------------------------
           // Phase 1 — Produce
-          // Each agent writes their plan. Their self-vote is parsed from the
-          // output and recorded in selfVotes[agent.name].
           // -----------------------------------------------------------------
-          const agentOutputs = {};  // agent.name → full output text
-          const selfVotes    = {};  // agent.name → "APPROVE" | "REVISE"
+          const agentOutputs = {}; // agent.name → full output text
+          const selfVotes = {}; // agent.name → "APPROVE" | "REVISE"
 
           for (const agent of agents) {
             const prompt = fillTemplate(produceTemplate, {
-              round:   String(args.round),
-              brief:   args.brief,
-              context: args.context ?? "This is the first round — no prior context.",
+              round: String(args.round),
+              brief: args.brief,
+              context:
+                args.context ?? "This is the first round — no prior context.",
             });
 
             try {
@@ -586,17 +793,18 @@ export const server = async (input) => {
                 prompt,
               );
               agentOutputs[agent.name] = output;
-              selfVotes[agent.name]    = detectVote(output);
+              selfVotes[agent.name] = detectVote(output);
             } catch (err) {
-              console.error(`[swarm_debate] Phase 1 error (${agent.name}): ${err.message}`);
+              console.error(
+                `[swarm_debate] Phase 1 error (${agent.name}): ${err.message}`,
+              );
               agentOutputs[agent.name] = `[ERROR: ${err.message}]`;
-              selfVotes[agent.name]    = "REVISE";
+              selfVotes[agent.name] = "REVISE";
             }
           }
 
           // -----------------------------------------------------------------
           // Phase 2 — Cross-Review
-          // Each agent reads every other agent's output and votes on it.
           // crossVotes[reviewer.name][reviewed.name] = "APPROVE" | "REVISE"
           // -----------------------------------------------------------------
           const crossVotes = {};
@@ -608,7 +816,7 @@ export const server = async (input) => {
               if (reviewer.name === reviewed.name) continue;
 
               const prompt = fillTemplate(crossReviewTemplate, {
-                agent_name:   reviewed.name,
+                agent_name: reviewed.name,
                 agent_output: agentOutputs[reviewed.name] ?? "(no output)",
               });
 
@@ -620,7 +828,8 @@ export const server = async (input) => {
                   reviewer.systemPrompt,
                   prompt,
                 );
-                crossVotes[reviewer.name][reviewed.name] = detectVote(reviewText);
+                crossVotes[reviewer.name][reviewed.name] =
+                  detectVote(reviewText);
               } catch (err) {
                 console.error(
                   `[swarm_debate] Phase 2 error (${reviewer.name} → ${reviewed.name}): ${err.message}`,
@@ -633,51 +842,36 @@ export const server = async (input) => {
           // -----------------------------------------------------------------
           // Tally — unanimous requires EVERY vote from BOTH phases to be APPROVE
           // -----------------------------------------------------------------
-          const allSelfVotes  = Object.values(selfVotes);
-          const allCrossVotes = Object.values(crossVotes).flatMap((v) => Object.values(v));
-          const allVotes      = [...allSelfVotes, ...allCrossVotes];
-          const unanimous     = allVotes.length > 0 && allVotes.every((v) => v === "APPROVE");
-
-          // Build context summary for the next round
-          const newContext = agents
-            .map(
-              (a) =>
-                `=== ${a.name} — self-vote: ${selfVotes[a.name]} ===\n` +
-                (agentOutputs[a.name] ?? "(no output)"),
-            )
-            .join("\n\n");
+          const allSelfVotes = Object.values(selfVotes);
+          const allCrossVotes = Object.values(crossVotes).flatMap((v) =>
+            Object.values(v),
+          );
+          const allVotes = [...allSelfVotes, ...allCrossVotes];
+          const unanimous =
+            allVotes.length > 0 && allVotes.every((v) => v === "APPROVE");
 
           // -----------------------------------------------------------------
-          // Write consensus.md when unanimous
+          // Phase 3 — Compress
+          // Distil all outputs + votes into a compact context for the next
+          // round. This is the key token-saving step: instead of passing
+          // potentially thousands of tokens of raw agent prose, we pass a
+          // structured ~400-word summary of what changed and what's open.
+          // We always compress, even on the final round, so the log is clean.
           // -----------------------------------------------------------------
-          const consensusRelPath = "output/plan/consensus.md";
-          if (unanimous) {
-            await mkdir(join(dir, ".swarm/output/plan"), { recursive: true });
-            const lines = [
-              `# Consensus Plan`,
-              ``,
-              `> Unanimous agreement reached after ${args.round} round(s).`,
-              ``,
-              `## Project Brief`,
-              ``,
-              args.brief,
-              ``,
-            ];
-            for (const agent of agents) {
-              lines.push(`## ${agent.name}`, ``, agentOutputs[agent.name] ?? "", ``);
-            }
-            await writeFile(
-              join(dir, `.swarm/${consensusRelPath}`),
-              lines.join("\n"),
-              "utf8",
-            );
-          }
+          const compressedContext = await compressContext(
+            client,
+            dir,
+            args.round,
+            agents,
+            agentOutputs,
+            selfVotes,
+            crossVotes,
+            compressTemplate,
+          );
 
           // -----------------------------------------------------------------
-          // Append to debate log
+          // Write to run directory
           // -----------------------------------------------------------------
-          await mkdir(join(dir, ".swarm/output/plan"), { recursive: true });
-
           const logEntry = [
             `## Round ${args.round}`,
             ``,
@@ -695,32 +889,82 @@ export const server = async (input) => {
             JSON.stringify(crossVotes, null, 2),
             "```",
             ``,
+            `### Phase 3 — Compressed Context`,
+            ``,
+            compressedContext,
+            ``,
             `### Result`,
             ``,
-            `Self-votes:  ${JSON.stringify(selfVotes)}`,
+            `Self-votes: ${JSON.stringify(selfVotes)}`,
             `All unanimous: **${unanimous}**`,
             ``,
           ].join("\n");
 
-          await appendLog(
-            join(dir, ".swarm/output/plan/debate_log.md"),
-            "Debate Log",
-            logEntry,
-          );
+          const runLogPath = join(runDir, "debate_log.md");
+          await appendLog(runLogPath, "Debate Log", logEntry);
+
+          // Consensus — written to run dir when unanimous
+          const consensusRunPath = join(runDir, "consensus.md");
+          if (unanimous) {
+            const lines = [
+              `# Consensus Plan`,
+              ``,
+              `> Run: ${runId}`,
+              `> Unanimous agreement reached after ${args.round} round(s).`,
+              ``,
+              `## Project Brief`,
+              ``,
+              args.brief,
+              ``,
+            ];
+            for (const agent of agents) {
+              lines.push(
+                `## ${agent.name}`,
+                ``,
+                agentOutputs[agent.name] ?? "",
+                ``,
+              );
+            }
+            await writeFile(consensusRunPath, lines.join("\n"), "utf8");
+          }
+
+          // Update meta
+          await writeMeta(runDir, {
+            roundsCompleted: args.round,
+            outcome: unanimous ? "consensus" : "in_progress",
+            selfVotes,
+            updatedAt: new Date().toISOString(),
+          });
+
+          // -----------------------------------------------------------------
+          // Publish to "current" paths so orchestrator references stay stable
+          // -----------------------------------------------------------------
+          await publishCurrent(runLogPath, dir, "output/plan/debate_log.md");
+          if (unanimous) {
+            await publishCurrent(
+              consensusRunPath,
+              dir,
+              "output/plan/consensus.md",
+            );
+          }
 
           return JSON.stringify({
+            runId,
             round: args.round,
             unanimous,
             selfVotes,
             crossVotes,
-            agentOutputs,
-            context: newContext,
+            // Return the compressed context, not raw outputs — far smaller
+            context: compressedContext,
             message: unanimous
               ? `All agents agreed (self + cross votes) after round ${args.round}. ` +
-                `Consensus written to .swarm/${consensusRelPath}`
+                `Run ID: ${runId}. ` +
+                `Consensus written to .swarm/output/runs/${runId}/plan/consensus.md ` +
+                `and .swarm/output/plan/consensus.md`
               : `Round ${args.round} complete — not unanimous. ` +
                 `Self-votes: ${JSON.stringify(selfVotes)}. ` +
-                `Call swarm_debate with round=${args.round + 1} and pass the returned context.`,
+                `Call swarm_debate with round=${args.round + 1}, ` +
+                `pass the returned context and runId="${runId}".`,
           });
         },
       }),
@@ -728,21 +972,32 @@ export const server = async (input) => {
       // ---------------------------------------------------------------------
       // swarm_build_run
       //
-      // Sends one implementation step to the Builder agent defined in
-      // .swarm/build.md and appends the output to the build log.
-      // The orchestrator calls this once per step after reading consensus.md.
+      // Sends one implementation step to the Builder agent. All steps in a
+      // single build session share a runId so they land in the same run dir.
+      // On the first step omit runId — a new one is generated. Pass the
+      // returned runId to every subsequent swarm_build_run call.
       // ---------------------------------------------------------------------
       swarm_build_run: tool({
         description:
           "Run one implementation step using the Builder agent from .swarm/build.md. " +
-          "Call once per step after reading consensus.md.",
+          "On the first step omit runId — a new one is generated. " +
+          "Pass the returned runId back on all subsequent steps so they share one run directory.",
         args: {
           step: tool.schema
             .string()
-            .describe("What to implement in this step, taken from the consensus plan."),
+            .describe(
+              "What to implement in this step, taken from the consensus plan.",
+            ),
+          runId: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Run ID from the first swarm_build_run call. Omit on the very first step.",
+            ),
         },
         async execute(args, ctx) {
           const dir = ctx.directory;
+          const runId = args.runId ?? makeRunId();
           ctx.metadata({ title: `Swarm Build — ${args.step.slice(0, 60)}` });
 
           // -- Read mode file -----------------------------------------------
@@ -753,10 +1008,9 @@ export const server = async (input) => {
             });
           }
 
-          const fm       = parseFrontmatter(modeContent);
-          const agentRaw = fm.agent    ?? "builder";
+          const fm = parseFrontmatter(modeContent);
+          const agentRaw = fm.agent ?? "builder";
           const planFile = fm.plan_file ?? "output/plan/consensus.md";
-          const logFile  = fm.log_file  ?? "output/build/build_log.md";
 
           const stepTemplate = extractSection(modeContent, "Step Prompt");
           if (!stepTemplate) {
@@ -801,38 +1055,62 @@ export const server = async (input) => {
             return JSON.stringify({ error: err.message });
           }
 
-          // -- Append to build log ------------------------------------------
-          await mkdir(join(dir, ".swarm/output/build"), { recursive: true });
-          await appendLog(
-            join(dir, `.swarm/${logFile}`),
-            "Build Log",
-            `## Step: ${args.step}\n\n${output}`,
-          );
+          // -- Write to run directory ---------------------------------------
+          const runDir = await ensureRunDir(dir, runId, "build");
+          const logEntry = `## Step: ${args.step}\n\n${output}`;
+          const runLogPath = join(runDir, "build_log.md");
+          await appendLog(runLogPath, "Build Log", logEntry);
 
-          return JSON.stringify({ step: args.step, output });
+          // Update meta
+          const metaPath = join(runDir, "meta.json");
+          let meta = {};
+          try {
+            meta = JSON.parse(await readFile(metaPath, "utf8"));
+          } catch {
+            /**/
+          }
+          const steps = Array.isArray(meta.steps) ? meta.steps : [];
+          steps.push({
+            step: args.step,
+            completedAt: new Date().toISOString(),
+          });
+          await writeMeta(runDir, {
+            runId,
+            phase: "build",
+            startedAt: meta.startedAt ?? new Date().toISOString(),
+            steps,
+            updatedAt: new Date().toISOString(),
+          });
+
+          // -- Publish to current -------------------------------------------
+          await publishCurrent(runLogPath, dir, "output/build/build_log.md");
+
+          return JSON.stringify({ runId, step: args.step, output });
         },
       }),
 
       // ---------------------------------------------------------------------
       // swarm_review_run
       //
-      // Runs the Reviewer agent from .swarm/review.md against consensus.md
-      // and writes the structured report to the configured report_file.
+      // Runs the Reviewer agent and writes a structured report.
+      // A new runId is generated for each review run.
       // ---------------------------------------------------------------------
       swarm_review_run: tool({
         description:
-          "Review the implementation against consensus.md using the agent from .swarm/review.md.",
+          "Review the implementation against consensus.md using the agent from .swarm/review.md. " +
+          "Each call creates a new timestamped run in .swarm/output/runs/.",
         args: {
           focus: tool.schema
             .string()
             .optional()
             .describe(
               "Optional: a specific area to focus on, e.g. 'auth', 'API contracts'. " +
-              "Leave empty for a full review.",
+                "Leave empty for a full review.",
             ),
         },
         async execute(args, ctx) {
           const dir = ctx.directory;
+          const runId = makeRunId();
           ctx.metadata({ title: "Swarm Review" });
 
           // -- Read mode file -----------------------------------------------
@@ -843,10 +1121,10 @@ export const server = async (input) => {
             });
           }
 
-          const fm         = parseFrontmatter(modeContent);
-          const agentRaw   = fm.agent        ?? "reviewer";
-          const planFile   = fm.plan_file    ?? "output/plan/consensus.md";
-          const reportFile = fm.report_file  ?? "output/review/review_report.md";
+          const fm = parseFrontmatter(modeContent);
+          const agentRaw = fm.agent ?? "reviewer";
+          const planFile = fm.plan_file ?? "output/plan/consensus.md";
+          const reportFile = fm.report_file ?? "output/review/review_report.md";
 
           const reviewTemplate = extractSection(modeContent, "Review Prompt");
           if (!reviewTemplate) {
@@ -876,9 +1154,11 @@ export const server = async (input) => {
           }
 
           // -- Run reviewer -------------------------------------------------
+          const focusText =
+            args.focus ?? "full review — cover everything in the plan";
           const prompt = fillTemplate(reviewTemplate, {
             plan,
-            focus: args.focus ?? "full review — cover everything in the plan",
+            focus: focusText,
           });
 
           let output;
@@ -894,17 +1174,37 @@ export const server = async (input) => {
             return JSON.stringify({ error: err.message });
           }
 
-          // -- Write report -------------------------------------------------
-          await mkdir(join(dir, ".swarm/output/review"), { recursive: true });
-          await writeFile(
-            join(dir, `.swarm/${reportFile}`),
-            `# Review Report\n\n${output}`,
-            "utf8",
-          );
+          // Detect verdict from output for meta
+          let verdict = "unknown";
+          if (/VERDICT:\s*PASS_WITH_WARNINGS/i.test(output))
+            verdict = "PASS_WITH_WARNINGS";
+          else if (/VERDICT:\s*PASS/i.test(output)) verdict = "PASS";
+          else if (/VERDICT:\s*FAIL/i.test(output)) verdict = "FAIL";
+
+          // -- Write to run directory ---------------------------------------
+          const runDir = await ensureRunDir(dir, runId, "review");
+          const reportContent = `# Review Report\n\n> Run: ${runId}\n> Focus: ${focusText}\n\n${output}`;
+          const runReportPath = join(runDir, "review_report.md");
+          await writeFile(runReportPath, reportContent, "utf8");
+
+          await writeMeta(runDir, {
+            runId,
+            phase: "review",
+            focus: focusText,
+            verdict,
+            startedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          });
+
+          // -- Publish to current -------------------------------------------
+          await publishCurrent(runReportPath, dir, reportFile);
 
           return JSON.stringify({
+            runId,
+            verdict,
             output,
-            reportPath: `.swarm/${reportFile}`,
+            reportPath: `.swarm/output/runs/${runId}/review/review_report.md`,
+            currentPath: `.swarm/${reportFile}`,
           });
         },
       }),

@@ -25,7 +25,7 @@ The Orchestrator's responsibilities:
 - Send the Cross-Review Prompt to every agent so they can vote on each other
 - Tally all votes — both self-votes from Phase 1 and cross-review votes from Phase 2
 - Unanimous means every single vote across both phases is APPROVE
-- If not unanimous, synthesise what needs to change into the next round's {{context}}
+- If not unanimous, pass the returned compressed context into the next round's {{context}}
 - If max_rounds is reached without consensus, stop and ask the user to decide
 
 The Orchestrator does NOT add its own vote and does NOT rewrite the agents' plans.
@@ -76,5 +76,41 @@ Read it from your own area of expertise. Call out anything that:
 At the very end write exactly one of:
   VOTE: APPROVE  — their plan is solid, no blockers from your perspective
   VOTE: REVISE   — there is a real problem (describe it specifically)
+
+---
+
+## Compress Prompt
+
+After every round this prompt is used to compress all agent outputs and votes
+into a short summary that becomes {{context}} for the next round.
+Keeping this concise is what prevents the context window from growing with each round.
+
+Variables available: {{round}}, {{agent_summaries}}, {{cross_votes}}
+
+---
+
+You are a neutral debate summariser. A multi-agent planning debate just completed round {{round}}.
+
+Agent outputs and self-votes:
+{{agent_summaries}}
+
+Cross-review votes (who reviewed whom → APPROVE/REVISE):
+{{cross_votes}}
+
+Write a concise summary (aim for under 400 words total) that the agents will read
+at the start of the next round. Be specific — vague summaries cause repeated mistakes.
+
+### Agent Summaries
+One short paragraph per agent: what they proposed and how they voted.
+
+### Revision Requests
+Bullet list of exact changes requested. Label each by which agent asked for it.
+Quote specific terms, endpoint names, field names, or component names where possible.
+
+### Open Questions
+Bullet list of things that remain unresolved or ambiguous between agents.
+
+### Agreed Points
+Bullet list of things all agents agree on. These do not need to be re-debated.
 
 ---
