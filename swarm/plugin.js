@@ -128,11 +128,18 @@ async function appendLog(logPath, header, entry) {
 
 // Run a single prompt in a temporary session and return the full text response.
 // The session is always deleted afterwards.
-async function runSession(client, dir, title, systemPrompt, promptText) {
+async function runSession(client, dir, title, systemPrompt, promptText, agentModel = null) {
   let sessionId;
   try {
+    const sessionConfig = { title };
+    
+    // If agentModel is provided, use it for this session
+    if (agentModel) {
+      sessionConfig.model = agentModel;
+    }
+    
     const created = await client.session.create({
-      body: { title },
+      body: sessionConfig,
       query: { directory: dir },
     });
     sessionId = created.data.id;
@@ -274,6 +281,76 @@ function listPlanSections(planContent) {
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — status tracking & UI indicators
+// ---------------------------------------------------------------------------
+
+// Update status file to show current progress
+async function updateStatus(dir, statusData) {
+  const statusPath = join(dir, '.swarm/output/current_status.json');
+  const fullStatus = {
+    ...statusData,
+    updatedAt: new Date().toISOString(),
+    timestamp: Date.now(),
+  };
+  
+  await mkdir(dirname(statusPath), { recursive: true });
+  await writeFile(statusPath, JSON.stringify(fullStatus, null, 2), 'utf8');
+  
+  return fullStatus;
+}
+
+// Clear status when operation is complete
+async function clearStatus(dir) {
+  const statusPath = join(dir, '.swarm/output/current_status.json');
+  try {
+    await writeFile(statusPath, JSON.stringify({
+      status: 'idle',
+      message: 'No swarm operation in progress',
+      updatedAt: new Date().toISOString(),
+    }, null, 2), 'utf8');
+  } catch {
+    // Ignore errors
+  }
+}
+
+// Create a progress message with emojis
+function createProgressMessage(phase, stage, agent, round, totalAgents, currentAgent) {
+  const phases = {
+    plan: '📋 Planning',
+    build: '🔨 Building',
+    review: '🔍 Reviewing'
+  };
+  
+  const stages = {
+    produce: 'Producing plan',
+    cross_review: 'Cross-reviewing',
+    compress: 'Compressing context',
+    building: 'Building step',
+    reviewing: 'Reviewing implementation'
+  };
+  
+  const phaseText = phases[phase] || phase;
+  const stageText = stages[stage] || stage;
+  
+  let message = `${phaseText} — ${stageText}`;
+  
+  if (agent) {
+    message += ` (${agent})`;
+  }
+  
+  if (round) {
+    message += ` • Round ${round}`;
+  }
+  
+  if (totalAgents && currentAgent) {
+    const progress = Math.round((currentAgent / totalAgents) * 100);
+    message += ` • ${currentAgent}/${totalAgents} agents • ${progress}%`;
+  }
+  
+  return message;
 }
 
 // Resolve the consensus.md path for a build step.
@@ -492,6 +569,8 @@ async function compressContext(
       // not tied to any specific agent's perspective.
       "You are a neutral debate summariser. Be concise and specific.",
       prompt,
+      // Use the orchestrator's model for compression (don't pass agent model)
+      null,
     );
     return compressed.trim();
   } catch (err) {
@@ -541,18 +620,21 @@ export const server = async (input) => {
       // -- 1-swarm-plan -----------------------------------------------------
       config.agent["1-swarm-plan"] = {
         mode: "primary",
-        description: "Multi-agent debate → consensus.md",
+        description: "Multi-agent debate → consensus.md (Planning ONLY)",
         maxSteps: 40,
-        permission: { edit: "allow", bash: "allow" },
+        permission: { edit: "deny", bash: "deny" }, // PLAN phase doesn't edit files
         prompt:
           "You are the Swarm Plan Orchestrator. " +
           "Your detailed instructions are in the system prompt below. " +
+          "IMPORTANT: You are ONLY for planning. Do NOT write code or edit files. " +
           "When the user describes a project, run the debate loop: " +
           "call swarm_debate with round=1 and the user's message as brief. " +
           "After each call check unanimous. If false, call swarm_debate again " +
           "with round+1, the returned context, and the returned runId. " +
           "If true, report that consensus.md has been written and show the runId. " +
-          "If escalate is true, summarise the disagreements and ask the user to decide.",
+          "If escalate is true, summarise the disagreements and ask the user to decide. " +
+          "During processing, agents are working in background sessions. " +
+          "You can say 'Agents are processing...' and show progress updates.",
         // Spread user overrides on top so config.json can still pin a model
         // or change any field without touching this file.
         ...config.agent["1-swarm-plan"],
@@ -561,12 +643,13 @@ export const server = async (input) => {
       // -- 2-swarm-build ----------------------------------------------------
       config.agent["2-swarm-build"] = {
         mode: "primary",
-        description: "Implements a consensus plan step by step",
+        description: "Implements a consensus plan step by step (Writes code)",
         maxSteps: 60,
-        permission: { edit: "allow", bash: "allow" },
+        permission: { edit: "allow", bash: "allow" }, // BUILD phase writes files
         prompt:
           "You are the Swarm Build Orchestrator. " +
           "Your detailed instructions are in the system prompt below. " +
+          "IMPORTANT: You are ONLY for implementation. You write code and edit files. " +
           "If the user specified a plan run ID (e.g. 'build from plan run 2025-…'), " +
           "use that as planRunId in every swarm_build_run call. " +
           "Otherwise call swarm_status with phase='plan' first, show the user the available " +
@@ -575,21 +658,26 @@ export const server = async (input) => {
           "and call swarm_build_run once per step passing planSection (the ## heading " +
           "in consensus.md that is most relevant to the step) to keep context small. " +
           "Pass the same runId to every swarm_build_run call so all steps share one run. " +
-          "After all steps, summarise what was built.",
+          "After all steps, summarise what was built. " +
+          "During processing, the builder agent works in background. " +
+          "You can say 'Builder is implementing step X...' and show progress.",
         ...config.agent["2-swarm-build"],
       };
 
       // -- 3-swarm-review ---------------------------------------------------
       config.agent["3-swarm-review"] = {
         mode: "primary",
-        description: "Reviews implementation against consensus.md",
+        description: "Reviews implementation against consensus.md (Read-only)",
         maxSteps: 10,
-        permission: { edit: "allow", bash: "allow" },
+        permission: { edit: "deny", bash: "deny" }, // REVIEW phase doesn't edit
         prompt:
           "You are the Swarm Review Orchestrator. " +
           "Your detailed instructions are in the system prompt below. " +
+          "IMPORTANT: You are ONLY for review. Do NOT write code or edit files. " +
           "Call swarm_review_run to compare the implementation against the " +
-          "approved plan. Present the compliance matrix and verdict clearly.",
+          "approved plan. Present the compliance matrix and verdict clearly. " +
+          "During processing, the reviewer agent works in background. " +
+          "You can say 'Reviewer is analyzing implementation...' and show status.",
         ...config.agent["3-swarm-review"],
       };
 
@@ -650,6 +738,17 @@ export const server = async (input) => {
             "and say 'build from plan run <runId>'. " +
             "If the user already specified a runId ({{input}}), confirm that run exists " +
             "and has outcome=consensus, then say they can switch to 2-swarm-build now.",
+        };
+      }
+
+      // -- /swarm_status_live command ---------------------------------------
+      if (!config.command["swarm_status_live"]) {
+        config.command["swarm_status_live"] = {
+          description: "Show live status of currently running swarm agents",
+          subtask: true,
+          template:
+            "Check the current status of swarm operations and display it clearly. " +
+            "Read .swarm/output/current_status.json and format the information.",
         };
       }
     },
@@ -877,8 +976,13 @@ export const server = async (input) => {
           const dir = ctx.directory;
           ctx.metadata({ title: `Swarm Plan — Round ${args.round}` });
 
-          // -- Resolve or create run ID ------------------------------------
-          const runId = args.runId ?? makeRunId();
+          // Clear any previous status
+          await clearStatus(dir);
+          
+          let runId;
+          try {
+            // -- Resolve or create run ID ------------------------------------
+            runId = args.runId ?? makeRunId();
 
           // -- Read mode file -----------------------------------------------
           const modeContent = await readProjectFile(dir, ".swarm/plan.md");
@@ -966,6 +1070,17 @@ export const server = async (input) => {
           // -- Ensure run directory -----------------------------------------
           const runDir = await ensureRunDir(dir, runId, "plan");
 
+          // Update status to show planning started
+          await updateStatus(dir, {
+            phase: 'plan',
+            stage: 'starting',
+            status: 'processing',
+            runId,
+            round: args.round,
+            totalAgents: agents.length,
+            message: createProgressMessage('plan', 'starting', null, args.round, agents.length, 0),
+          });
+
           // Write/update meta at the start of the round
           if (args.round === 1) {
             await writeMeta(runDir, {
@@ -986,7 +1101,22 @@ export const server = async (input) => {
           const agentOutputs = {}; // agent.name → full output text
           const selfVotes = {}; // agent.name → "APPROVE" | "REVISE"
 
-          for (const agent of agents) {
+          for (let i = 0; i < agents.length; i++) {
+            const agent = agents[i];
+            
+            // Update status to show which agent is working
+            await updateStatus(dir, {
+              phase: 'plan',
+              stage: 'produce',
+              status: 'processing',
+              runId,
+              round: args.round,
+              agent: agent.name,
+              currentAgent: i + 1,
+              totalAgents: agents.length,
+              message: createProgressMessage('plan', 'produce', agent.name, args.round, agents.length, i + 1),
+            });
+
             const prompt = fillTemplate(produceTemplate, {
               round: String(args.round),
               brief: args.brief,
@@ -1001,6 +1131,7 @@ export const server = async (input) => {
                 `Swarm Plan R${args.round} — ${agent.name}`,
                 agent.systemPrompt,
                 prompt,
+                agent.model, // Pass agent's model
               );
               agentOutputs[agent.name] = output;
               selfVotes[agent.name] = detectVote(output);
@@ -1018,6 +1149,16 @@ export const server = async (input) => {
           // crossVotes[reviewer.name][reviewed.name] = "APPROVE" | "REVISE"
           // -----------------------------------------------------------------
           const crossVotes = {};
+
+          // Update status for cross-review phase
+          await updateStatus(dir, {
+            phase: 'plan',
+            stage: 'cross_review',
+            status: 'processing',
+            runId,
+            round: args.round,
+            message: createProgressMessage('plan', 'cross_review', null, args.round, agents.length, 0),
+          });
 
           for (const reviewer of agents) {
             crossVotes[reviewer.name] = {};
@@ -1037,6 +1178,7 @@ export const server = async (input) => {
                   `Swarm Cross-Review R${args.round} — ${reviewer.name} → ${reviewed.name}`,
                   reviewer.systemPrompt,
                   prompt,
+                  reviewer.model, // Pass reviewer's model
                 );
                 crossVotes[reviewer.name][reviewed.name] =
                   detectVote(reviewText);
@@ -1068,6 +1210,17 @@ export const server = async (input) => {
           // structured ~400-word summary of what changed and what's open.
           // We always compress, even on the final round, so the log is clean.
           // -----------------------------------------------------------------
+          
+          // Update status for compression phase
+          await updateStatus(dir, {
+            phase: 'plan',
+            stage: 'compress',
+            status: 'processing',
+            runId,
+            round: args.round,
+            message: createProgressMessage('plan', 'compress', null, args.round, agents.length, 0),
+          });
+          
           const compressedContext = await compressContext(
             client,
             dir,
@@ -1158,6 +1311,29 @@ export const server = async (input) => {
             );
           }
 
+          // Update final status
+          if (unanimous) {
+            await updateStatus(dir, {
+              phase: 'plan',
+              stage: 'complete',
+              status: 'completed',
+              runId,
+              round: args.round,
+              result: 'consensus',
+              message: `✅ Planning complete! Consensus reached after round ${args.round}.`,
+            });
+          } else {
+            await updateStatus(dir, {
+              phase: 'plan',
+              stage: 'complete',
+              status: 'completed',
+              runId,
+              round: args.round,
+              result: 'needs_next_round',
+              message: `🔄 Round ${args.round} complete. Ready for next round.`,
+            });
+          }
+
           return JSON.stringify({
             runId,
             round: args.round,
@@ -1176,6 +1352,23 @@ export const server = async (input) => {
                 `Call swarm_debate with round=${args.round + 1}, ` +
                 `pass the returned context and runId="${runId}".`,
           });
+        } catch (err) {
+          // Update status with error
+          await updateStatus(dir, {
+            phase: 'plan',
+            stage: 'error',
+            status: 'error',
+            runId: runId || 'unknown',
+            error: err.message,
+            message: `❌ Planning failed: ${err.message}`,
+          });
+          
+          console.error(`[swarm_debate] Error: ${err.message}`, err);
+          return JSON.stringify({
+            error: `Swarm debate failed: ${err.message}`,
+            runId: runId || null,
+          });
+        }
         },
       }),
 
@@ -1227,6 +1420,9 @@ export const server = async (input) => {
           const dir = ctx.directory;
           const runId = args.runId ?? makeRunId();
           ctx.metadata({ title: `Swarm Build — ${args.step.slice(0, 60)}` });
+
+          // Clear any previous status
+          await clearStatus(dir);
 
           // -- Read mode file -----------------------------------------------
           const modeContent = await readProjectFile(dir, ".swarm/build.md");
@@ -1293,6 +1489,17 @@ export const server = async (input) => {
             }
           }
 
+          // -- Update status for building ------------------------------------
+          await updateStatus(dir, {
+            phase: 'build',
+            stage: 'building',
+            status: 'processing',
+            runId,
+            step: args.step,
+            agent: agent.name,
+            message: createProgressMessage('build', 'building', agent.name, null, 1, 1),
+          });
+
           // -- Run builder --------------------------------------------------
           const prompt = fillTemplate(stepTemplate, { plan, step: args.step });
 
@@ -1304,8 +1511,20 @@ export const server = async (input) => {
               `Swarm Build — ${args.step.slice(0, 50)}`,
               agent.systemPrompt,
               prompt,
+              agent.model, // Pass builder's model
             );
           } catch (err) {
+            // Update status with error
+            await updateStatus(dir, {
+              phase: 'build',
+              stage: 'building',
+              status: 'error',
+              runId,
+              step: args.step,
+              agent: agent.name,
+              error: err.message,
+              message: `❌ Build failed: ${err.message}`,
+            });
             return JSON.stringify({ error: err.message });
           }
 
@@ -1339,6 +1558,17 @@ export const server = async (input) => {
 
           // -- Publish to current -------------------------------------------
           await publishCurrent(runLogPath, dir, "output/build/build_log.md");
+
+          // Update status for completion
+          await updateStatus(dir, {
+            phase: 'build',
+            stage: 'complete',
+            status: 'completed',
+            runId,
+            step: args.step,
+            agent: agent.name,
+            message: `✅ Build step completed: ${args.step}`,
+          });
 
           // Surface available sections so orchestrator knows what to pass
           // on subsequent steps without reading the full plan itself.
@@ -1378,6 +1608,9 @@ export const server = async (input) => {
           const dir = ctx.directory;
           const runId = makeRunId();
           ctx.metadata({ title: "Swarm Review" });
+
+          // Clear any previous status
+          await clearStatus(dir);
 
           // -- Read mode file -----------------------------------------------
           const modeContent = await readProjectFile(dir, ".swarm/review.md");
@@ -1419,9 +1652,21 @@ export const server = async (input) => {
             });
           }
 
-          // -- Run reviewer -------------------------------------------------
+          // -- Update status for reviewing -----------------------------------
           const focusText =
             args.focus ?? "full review — cover everything in the plan";
+          
+          await updateStatus(dir, {
+            phase: 'review',
+            stage: 'reviewing',
+            status: 'processing',
+            runId,
+            focus: focusText,
+            agent: agent.name,
+            message: createProgressMessage('review', 'reviewing', agent.name, null, 1, 1),
+          });
+
+          // -- Run reviewer -------------------------------------------------
           const prompt = fillTemplate(reviewTemplate, {
             plan,
             focus: focusText,
@@ -1435,8 +1680,20 @@ export const server = async (input) => {
               "Swarm Review",
               agent.systemPrompt,
               prompt,
+              agent.model, // Pass reviewer's model
             );
           } catch (err) {
+            // Update status with error
+            await updateStatus(dir, {
+              phase: 'review',
+              stage: 'reviewing',
+              status: 'error',
+              runId,
+              focus: focusText,
+              agent: agent.name,
+              error: err.message,
+              message: `❌ Review failed: ${err.message}`,
+            });
             return JSON.stringify({ error: err.message });
           }
 
@@ -1460,6 +1717,17 @@ export const server = async (input) => {
             verdict,
             startedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
+          });
+
+          // Update status for completion
+          await updateStatus(dir, {
+            phase: 'review',
+            stage: 'complete',
+            status: 'completed',
+            runId,
+            verdict,
+            agent: agent.name,
+            message: `✅ Review completed. Verdict: ${verdict}`,
           });
 
           // -- Publish to current -------------------------------------------
@@ -1788,6 +2056,7 @@ export const server = async (input) => {
                   `Swarm Plan R${currentRound} — ${agent.name} [resumed]`,
                   agent.systemPrompt,
                   prompt,
+                  agent.model, // Pass agent's model
                 );
                 agentOutputs[agent.name] = output;
                 selfVotes[agent.name] = detectVote(output);
@@ -1817,6 +2086,7 @@ export const server = async (input) => {
                     `Swarm Cross-Review R${currentRound} — ${reviewer.name} → ${reviewed.name} [resumed]`,
                     reviewer.systemPrompt,
                     prompt,
+                    reviewer.model, // Pass reviewer's model
                   );
                   crossVotes[reviewer.name][reviewed.name] =
                     detectVote(reviewText);
@@ -1962,6 +2232,104 @@ export const server = async (input) => {
           }
 
           return JSON.stringify(finalResult);
+        },
+      }),
+    // ---------------------------------------------------------------------
+      // swarm_status_live
+      //
+      // Shows live status of currently running swarm operations
+      // ---------------------------------------------------------------------
+      swarm_status_live: tool({
+        description: "Show live status of currently running swarm agents",
+        args: {},
+        async execute(args, ctx) {
+          const dir = ctx.directory;
+          ctx.metadata({ title: "Swarm Live Status" });
+
+          const statusPath = join(dir, '.swarm/output/current_status.json');
+          let status = {};
+          
+          try {
+            const content = await readFile(statusPath, 'utf8');
+            status = JSON.parse(content);
+          } catch (err) {
+            return JSON.stringify({
+              status: 'idle',
+              summary: "## Swarm Live Status\n\n**Status:** 🟡 Idle\n\nNo swarm operation is currently running.\n\nStart a swarm plan, build, or review to see live status.",
+            });
+          }
+
+          // Format status display
+          const statusEmoji = {
+            'processing': '🔄',
+            'completed': '✅',
+            'error': '❌',
+            'idle': '🟡'
+          }[status.status || 'idle'] || '❓';
+
+          const phaseNames = {
+            'plan': '📋 Planning',
+            'build': '🔨 Building',
+            'review': '🔍 Reviewing'
+          };
+
+          const lines = [
+            '## Swarm Live Status',
+            '',
+            `**Status:** ${statusEmoji} ${status.status?.toUpperCase() || 'IDLE'}`,
+          ];
+
+          if (status.phase) {
+            lines.push(`**Phase:** ${phaseNames[status.phase] || status.phase}`);
+          }
+          
+          if (status.stage) {
+            lines.push(`**Stage:** ${status.stage}`);
+          }
+          
+          if (status.agent) {
+            lines.push(`**Agent:** ${status.agent}`);
+          }
+          
+          if (status.runId) {
+            lines.push(`**Run ID:** ${status.runId}`);
+          }
+          
+          if (status.round) {
+            lines.push(`**Round:** ${status.round}`);
+          }
+          
+          if (status.step) {
+            lines.push(`**Step:** ${status.step}`);
+          }
+          
+          if (status.focus) {
+            lines.push(`**Focus:** ${status.focus}`);
+          }
+          
+          if (status.currentAgent && status.totalAgents) {
+            const progress = Math.round((status.currentAgent / status.totalAgents) * 100);
+            lines.push(`**Progress:** ${status.currentAgent}/${status.totalAgents} agents (${progress}%)`);
+          }
+          
+          if (status.message) {
+            lines.push('', '**Message:**', status.message);
+          }
+          
+          if (status.error) {
+            lines.push('', '**Error:**', `❌ ${status.error}`);
+          }
+          
+          if (status.verdict) {
+            lines.push('', '**Verdict:**', status.verdict);
+          }
+          
+          lines.push('', `**Last Updated:** ${status.updatedAt || 'Unknown'}`);
+
+          return JSON.stringify({
+            status,
+            summary: lines.join('\n'),
+          });
         },
       }),
     },
