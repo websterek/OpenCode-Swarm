@@ -241,6 +241,176 @@ async function publishCurrent(src, projectDir, currentRelPath) {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers — plan section extraction
+//
+// consensus.md is structured with ## headings per agent. For each build step
+// only the relevant section (matching a heading name) is injected, keeping
+// the builder session's context small instead of sending the entire plan.
+// ---------------------------------------------------------------------------
+
+// Extract a single ## section from plan content by heading name.
+// Returns the full section text (heading + body) or null if not found.
+function extractPlanSection(planContent, sectionName) {
+  if (!planContent || !sectionName) return null;
+  const re = new RegExp(
+    `(##\\s+${escapeRegex(sectionName.trim())}\\s*\\n[\\s\\S]*?)(?=\\n##\\s|$)`,
+    "i",
+  );
+  const m = planContent.match(re);
+  return m ? m[1].trim() : null;
+}
+
+// List all ## heading names in a plan document (skips # top-level title).
+function listPlanSections(planContent) {
+  if (!planContent) return [];
+  const re = /^##\s+(.+)$/gm;
+  const names = [];
+  let m;
+  while ((m = re.exec(planContent)) !== null) {
+    names.push(m[1].trim());
+  }
+  return names;
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Resolve the consensus.md path for a build step.
+// If planRunId is given → reads from the run directory.
+// Otherwise falls back to the current output/plan/consensus.md.
+async function resolvePlan(dir, planRunId, fallbackRelPath) {
+  if (planRunId) {
+    const runPath = `output/runs/${planRunId}/plan/consensus.md`;
+    const content = await readProjectFile(dir, `.swarm/${runPath}`);
+    if (!content) {
+      return {
+        error:
+          `No consensus.md found for plan run "${planRunId}". ` +
+          "Use swarm_status to list available plan runs.",
+      };
+    }
+    return { content, resolvedPath: `.swarm/${runPath}` };
+  }
+  const content = await readProjectFile(dir, `.swarm/${fallbackRelPath}`);
+  if (!content) {
+    return {
+      error:
+        `Consensus plan not found at .swarm/${fallbackRelPath}. ` +
+        "Run Swarm - Plan first, or specify a planRunId.",
+    };
+  }
+  return { content, resolvedPath: `.swarm/${fallbackRelPath}` };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — status & resume
+// ---------------------------------------------------------------------------
+
+// Read every meta.json under .swarm/output/runs/ and return an array of
+// { runId, phase, ...metaFields } objects sorted newest-first.
+// Directories that have no meta.json (e.g. interrupted mid-write) are skipped.
+async function readAllRunMetas(projectDir) {
+  const runsRoot = join(projectDir, ".swarm/output/runs");
+  const results = [];
+
+  let runDirs;
+  try {
+    runDirs = await readdir(runsRoot, { withFileTypes: true });
+  } catch {
+    return results; // no runs directory yet
+  }
+
+  for (const runEntry of runDirs) {
+    if (!runEntry.isDirectory()) continue;
+    const runId = runEntry.name;
+    const runPath = join(runsRoot, runId);
+
+    // Each runId can have phase subdirectories: plan/, build/, review/
+    let phaseDirs;
+    try {
+      phaseDirs = await readdir(runPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const phaseEntry of phaseDirs) {
+      if (!phaseEntry.isDirectory()) continue;
+      const metaPath = join(runPath, phaseEntry.name, "meta.json");
+      try {
+        const raw = await readFile(metaPath, "utf8");
+        const meta = JSON.parse(raw);
+        results.push({ runId, ...meta });
+      } catch {
+        // meta.json missing or corrupt — include a stub so the run is visible
+        results.push({
+          runId,
+          phase: phaseEntry.name,
+          outcome: "unknown",
+          startedAt: null,
+        });
+      }
+    }
+  }
+
+  // Sort newest-first by startedAt, falling back to runId (which is a timestamp string)
+  results.sort((a, b) => {
+    const ta = a.startedAt ?? a.runId;
+    const tb = b.startedAt ?? b.runId;
+    return tb < ta ? -1 : tb > ta ? 1 : 0;
+  });
+
+  return results;
+}
+
+// List the files that actually exist inside a run/phase directory.
+async function listRunFiles(projectDir, runId, phase) {
+  const phaseDir = join(projectDir, ".swarm/output/runs", runId, phase);
+  try {
+    const entries = await readdir(phaseDir, { withFileTypes: true });
+    return entries
+      .filter((e) => e.isFile() && e.name !== "meta.json")
+      .map((e) => `.swarm/output/runs/${runId}/${phase}/${e.name}`);
+  } catch {
+    return [];
+  }
+}
+
+// Extract the compressed context from the last completed round in a
+// debate_log.md. Returns null if nothing can be found.
+//
+// The log format written by swarm_debate is:
+//   ## Round N
+//   ...
+//   ### Phase 3 — Compressed Context
+//   <compressed text>
+//   ### Result
+//   ...
+function extractLastCompressedContext(logContent) {
+  if (!logContent) return null;
+
+  // Find all "### Phase 3 — Compressed Context" blocks
+  const re = /###\s+Phase 3[^\n]*\n([\s\S]*?)(?=\n###\s|\n##\s|$)/gi;
+  let lastMatch = null;
+  let m;
+  while ((m = re.exec(logContent)) !== null) {
+    lastMatch = m[1].trim();
+  }
+  return lastMatch || null;
+}
+
+// Extract the brief from the first round entry in a debate_log.md.
+// The debate_log does not store the brief directly, so we fall back to the
+// consensus.md file (which includes "## Project Brief").
+function extractBriefFromConsensus(consensusContent) {
+  if (!consensusContent) return null;
+  const m = consensusContent.match(
+    /##\s+Project Brief\s*\n([\s\S]*?)(?=\n##\s|$)/i,
+  );
+  return m ? m[1].trim() : null;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers — context compression
 //
 // After each debate round, instead of passing the raw full text of every
@@ -368,8 +538,8 @@ export const server = async (input) => {
       config.agent = config.agent ?? {};
       config.command = config.command ?? {};
 
-      // -- swarm-plan -------------------------------------------------------
-      config.agent["swarm-plan"] = {
+      // -- 1-swarm-plan -----------------------------------------------------
+      config.agent["1-swarm-plan"] = {
         mode: "primary",
         description: "Multi-agent debate → consensus.md",
         maxSteps: 40,
@@ -385,27 +555,32 @@ export const server = async (input) => {
           "If escalate is true, summarise the disagreements and ask the user to decide.",
         // Spread user overrides on top so config.json can still pin a model
         // or change any field without touching this file.
-        ...config.agent["swarm-plan"],
+        ...config.agent["1-swarm-plan"],
       };
 
-      // -- swarm-build ------------------------------------------------------
-      config.agent["swarm-build"] = {
+      // -- 2-swarm-build ----------------------------------------------------
+      config.agent["2-swarm-build"] = {
         mode: "primary",
-        description: "Implements consensus.md step by step",
+        description: "Implements a consensus plan step by step",
         maxSteps: 60,
         permission: { edit: "allow", bash: "allow" },
         prompt:
           "You are the Swarm Build Orchestrator. " +
           "Your detailed instructions are in the system prompt below. " +
-          "Read .swarm/output/plan/consensus.md to understand the approved plan. " +
-          "Break it into logical implementation steps and call swarm_build_run " +
-          "once per step, in order. Pass the same runId to every swarm_build_run call " +
-          "so all steps are grouped in one run. After all steps, summarise what was built.",
-        ...config.agent["swarm-build"],
+          "If the user specified a plan run ID (e.g. 'build from plan run 2025-…'), " +
+          "use that as planRunId in every swarm_build_run call. " +
+          "Otherwise call swarm_status with phase='plan' first, show the user the available " +
+          "consensus plans, and ask which one to build — then use its runId as planRunId. " +
+          "Read the chosen consensus.md, break it into logical implementation steps, " +
+          "and call swarm_build_run once per step passing planSection (the ## heading " +
+          "in consensus.md that is most relevant to the step) to keep context small. " +
+          "Pass the same runId to every swarm_build_run call so all steps share one run. " +
+          "After all steps, summarise what was built.",
+        ...config.agent["2-swarm-build"],
       };
 
-      // -- swarm-review -----------------------------------------------------
-      config.agent["swarm-review"] = {
+      // -- 3-swarm-review ---------------------------------------------------
+      config.agent["3-swarm-review"] = {
         mode: "primary",
         description: "Reviews implementation against consensus.md",
         maxSteps: 10,
@@ -415,31 +590,66 @@ export const server = async (input) => {
           "Your detailed instructions are in the system prompt below. " +
           "Call swarm_review_run to compare the implementation against the " +
           "approved plan. Present the compliance matrix and verdict clearly.",
-        ...config.agent["swarm-review"],
+        ...config.agent["3-swarm-review"],
       };
 
       // -- swarm-init (lightweight, only used by the /swarm_init command) ---
-      config.agent["swarm-init"] = {
-        mode: "primary",
-        description: "Initialises .swarm/ in the current project",
-        maxSteps: 3,
-        permission: { edit: "allow" },
-        prompt:
-          "You are the Swarm Init agent. " +
-          "Call the swarm_init tool to copy the default .swarm/ template into " +
-          "this project, then tell the user what was created and how to get started.",
-        ...config.agent["swarm-init"],
-      };
-
       // -- /swarm_init command ----------------------------------------------
+      // Runs as a subtask inside whatever agent/mode is currently active.
       if (!config.command["swarm_init"]) {
         config.command["swarm_init"] = {
           description:
             "Set up .swarm/ in this project (copies the default template)",
-          agent: "swarm-init",
+          subtask: true,
           template:
-            "Initialise this project with the Swarm setup. " +
-            "Call swarm_init to copy the template files into .swarm/",
+            "Call swarm_init to copy the default .swarm/ template into this " +
+            "project, then tell the user what was created and how to get started.",
+        };
+      }
+
+      // -- /swarm_status command --------------------------------------------
+      // Runs as a subtask inside whatever agent/mode is currently active.
+      // No agent switch — just calls the tool and prints results inline.
+      if (!config.command["swarm_status"]) {
+        config.command["swarm_status"] = {
+          description: "Show status of all past swarm runs in this project",
+          subtask: true,
+          template:
+            "Call swarm_status to list all past swarm runs in this project " +
+            "and present the results clearly. " +
+            "If a runId was provided by the user, pass it to show detail for that run only: {{input}}",
+        };
+      }
+
+      // -- /swarm_resume command --------------------------------------------
+      // Runs as a subtask — resumes the debate inline without mode switching.
+      if (!config.command["swarm_resume"]) {
+        config.command["swarm_resume"] = {
+          description:
+            "Resume an interrupted Swarm Plan debate from its last completed round",
+          subtask: true,
+          template:
+            "Call swarm_resume with this runId to continue the interrupted debate: {{input}} " +
+            "If no runId was given, first call swarm_status to list runs with outcome " +
+            "in_progress, then ask the user which one to resume.",
+        };
+      }
+
+      // -- /swarm_build_select command --------------------------------------
+      // Subtask that lists consensus-reached plan runs and tells the user
+      // how to start a build from a specific one.
+      if (!config.command["swarm_build_select"]) {
+        config.command["swarm_build_select"] = {
+          description:
+            "List available consensus plans and switch to Swarm - Build with a chosen one",
+          subtask: true,
+          template:
+            "Call swarm_status with phase='plan' to list all plan runs. " +
+            "Show only the ones with outcome='consensus', including their runId and brief. " +
+            "Tell the user: to build from a specific plan, switch to the '2-swarm-build' agent " +
+            "and say 'build from plan run <runId>'. " +
+            "If the user already specified a runId ({{input}}), confirm that run exists " +
+            "and has outcome=consensus, then say they can switch to 2-swarm-build now.",
         };
       }
     },
@@ -981,7 +1191,9 @@ export const server = async (input) => {
         description:
           "Run one implementation step using the Builder agent from .swarm/build.md. " +
           "On the first step omit runId — a new one is generated. " +
-          "Pass the returned runId back on all subsequent steps so they share one run directory.",
+          "Pass the returned runId back on all subsequent steps so they share one run directory. " +
+          "Use planRunId to build from a specific plan run instead of the current consensus.md. " +
+          "Use planSection to inject only the relevant ## heading from the plan, reducing context size.",
         args: {
           step: tool.schema
             .string()
@@ -993,6 +1205,22 @@ export const server = async (input) => {
             .optional()
             .describe(
               "Run ID from the first swarm_build_run call. Omit on the very first step.",
+            ),
+          planRunId: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Plan run ID to build from (e.g. '2025-04-18_15-32-01'). " +
+                "If omitted, uses the current .swarm/output/plan/consensus.md. " +
+                "Get available IDs from swarm_status.",
+            ),
+          planSection: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Name of a ## heading in the consensus plan to inject for this step (e.g. 'Backend Architect'). " +
+                "When set, only that section is sent to the builder instead of the full plan — " +
+                "significantly reduces context size. Omit to send the full plan.",
             ),
         },
         async execute(args, ctx) {
@@ -1029,14 +1257,40 @@ export const server = async (input) => {
             });
           }
 
-          // -- Load plan ----------------------------------------------------
-          const plan = await readProjectFile(dir, `.swarm/${planFile}`);
-          if (!plan) {
-            return JSON.stringify({
-              error:
-                `Consensus plan not found at .swarm/${planFile}. ` +
-                "Run Swarm - Plan first.",
-            });
+          // -- Load plan (from specific run or current) ----------------------
+          const planResult = await resolvePlan(
+            dir,
+            args.planRunId ?? null,
+            planFile,
+          );
+          if (planResult.error) {
+            return JSON.stringify({ error: planResult.error });
+          }
+          const fullPlan = planResult.content;
+
+          // -- Extract only the relevant section if planSection is given ----
+          // This is the primary context-reduction mechanism for build steps:
+          // instead of injecting the full multi-agent consensus (potentially
+          // thousands of tokens), we inject only the one ## section that
+          // is relevant to the current step.
+          let plan = fullPlan;
+          let sectionNote = "";
+          if (args.planSection) {
+            const extracted = extractPlanSection(fullPlan, args.planSection);
+            if (extracted) {
+              plan = extracted;
+              sectionNote = ` (section: ${args.planSection})`;
+            } else {
+              // Section not found — list available sections so orchestrator
+              // can correct the name on the next call.
+              const available = listPlanSections(fullPlan);
+              return JSON.stringify({
+                error:
+                  `Section "${args.planSection}" not found in the plan. ` +
+                  `Available sections: ${available.join(", ")}`,
+                availableSections: available,
+              });
+            }
           }
 
           // -- Run builder --------------------------------------------------
@@ -1057,7 +1311,7 @@ export const server = async (input) => {
 
           // -- Write to run directory ---------------------------------------
           const runDir = await ensureRunDir(dir, runId, "build");
-          const logEntry = `## Step: ${args.step}\n\n${output}`;
+          const logEntry = `## Step: ${args.step}${sectionNote}\n\n${output}`;
           const runLogPath = join(runDir, "build_log.md");
           await appendLog(runLogPath, "Build Log", logEntry);
 
@@ -1077,6 +1331,7 @@ export const server = async (input) => {
           await writeMeta(runDir, {
             runId,
             phase: "build",
+            planRunId: args.planRunId ?? null,
             startedAt: meta.startedAt ?? new Date().toISOString(),
             steps,
             updatedAt: new Date().toISOString(),
@@ -1085,7 +1340,18 @@ export const server = async (input) => {
           // -- Publish to current -------------------------------------------
           await publishCurrent(runLogPath, dir, "output/build/build_log.md");
 
-          return JSON.stringify({ runId, step: args.step, output });
+          // Surface available sections so orchestrator knows what to pass
+          // on subsequent steps without reading the full plan itself.
+          const availableSections = listPlanSections(fullPlan);
+
+          return JSON.stringify({
+            runId,
+            step: args.step,
+            planSection: args.planSection ?? null,
+            planRunId: args.planRunId ?? null,
+            availableSections,
+            output,
+          });
         },
       }),
 
@@ -1206,6 +1472,496 @@ export const server = async (input) => {
             reportPath: `.swarm/output/runs/${runId}/review/review_report.md`,
             currentPath: `.swarm/${reportFile}`,
           });
+        },
+      }),
+
+      // ---------------------------------------------------------------------
+      // swarm_status
+      //
+      // Lists every run recorded under .swarm/output/runs/ with its outcome,
+      // round count, verdict, and the files produced. Accepts an optional
+      // runId to show detail for a single run, and an optional phase filter.
+      // ---------------------------------------------------------------------
+      swarm_status: tool({
+        description:
+          "List all past swarm runs in this project. " +
+          "Shows outcome, rounds, verdict, and files for every run. " +
+          "Pass runId to inspect a single run in detail. " +
+          "Pass phase ('plan'|'build'|'review') to filter.",
+        args: {
+          runId: tool.schema
+            .string()
+            .optional()
+            .describe("Show detail for this specific run ID only."),
+          phase: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "Filter to a specific phase: 'plan', 'build', or 'review'.",
+            ),
+        },
+        async execute(args, ctx) {
+          const dir = ctx.directory;
+          ctx.metadata({ title: "Swarm Status" });
+
+          const allMetas = await readAllRunMetas(dir);
+
+          if (allMetas.length === 0) {
+            return JSON.stringify({
+              runs: [],
+              summary:
+                "No swarm runs found in this project. " +
+                "Run /swarm_init and then switch to Swarm - Plan to start.",
+            });
+          }
+
+          // Filter by runId or phase if requested
+          let filtered = allMetas;
+          if (args.runId) {
+            filtered = filtered.filter((m) => m.runId === args.runId);
+            if (filtered.length === 0) {
+              return JSON.stringify({
+                error: `No run found with ID "${args.runId}".`,
+                availableRunIds: [...new Set(allMetas.map((m) => m.runId))],
+              });
+            }
+          }
+          if (args.phase) {
+            filtered = filtered.filter((m) => m.phase === args.phase);
+          }
+
+          // Enrich each meta entry with the list of files produced
+          const enriched = await Promise.all(
+            filtered.map(async (meta) => {
+              const files = await listRunFiles(dir, meta.runId, meta.phase);
+              return { ...meta, files };
+            }),
+          );
+
+          // Build a human-readable summary table
+          const lines = [`Swarm runs (${enriched.length} found):`, ""];
+
+          // Group by runId for display
+          const byRunId = {};
+          for (const entry of enriched) {
+            if (!byRunId[entry.runId]) byRunId[entry.runId] = [];
+            byRunId[entry.runId].push(entry);
+          }
+
+          for (const [runId, phases] of Object.entries(byRunId)) {
+            lines.push(`### Run: ${runId}`);
+            for (const p of phases) {
+              const outcomeIcon =
+                p.outcome === "consensus"
+                  ? "✅"
+                  : p.outcome === "escalated"
+                    ? "⚠️"
+                    : p.outcome === "in_progress"
+                      ? "🔄"
+                      : p.outcome === "unknown"
+                        ? "❓"
+                        : p.verdict === "PASS"
+                          ? "✅"
+                          : p.verdict === "PASS_WITH_WARNINGS"
+                            ? "⚠️"
+                            : p.verdict === "FAIL"
+                              ? "❌"
+                              : "❓";
+
+              lines.push(
+                `  Phase: ${p.phase}  ${outcomeIcon} ${p.outcome ?? p.verdict ?? ""}`,
+              );
+
+              if (p.phase === "plan") {
+                lines.push(`  Rounds completed: ${p.roundsCompleted ?? "?"}`);
+                if (p.brief) {
+                  const shortBrief =
+                    p.brief.length > 80 ? p.brief.slice(0, 80) + "…" : p.brief;
+                  lines.push(`  Brief: ${shortBrief}`);
+                }
+                if (p.agents) {
+                  lines.push(`  Agents: ${p.agents.join(", ")}`);
+                }
+              }
+              if (p.phase === "build") {
+                const stepCount = Array.isArray(p.steps) ? p.steps.length : "?";
+                lines.push(`  Steps completed: ${stepCount}`);
+              }
+              if (p.phase === "review") {
+                lines.push(`  Verdict: ${p.verdict ?? "unknown"}`);
+                if (p.focus) lines.push(`  Focus: ${p.focus}`);
+              }
+
+              lines.push(`  Started: ${p.startedAt ?? "unknown"}`);
+
+              if (p.files && p.files.length > 0) {
+                lines.push(`  Files:`);
+                p.files.forEach((f) => lines.push(`    ${f}`));
+              }
+              lines.push("");
+            }
+          }
+
+          return JSON.stringify({
+            runs: enriched,
+            summary: lines.join("\n"),
+          });
+        },
+      }),
+
+      // ---------------------------------------------------------------------
+      // swarm_resume
+      //
+      // Resumes a plan debate that was interrupted (network error, token
+      // limit, process killed, etc.).
+      //
+      // Strategy:
+      //   1. Read meta.json for the given runId — get brief, roundsCompleted,
+      //      agents, maxRounds, outcome.
+      //   2. Guard against resuming a run that already finished.
+      //   3. Read debate_log.md and extract the compressed context from the
+      //      last completed round's "### Phase 3 — Compressed Context" block.
+      //   4. Call swarm_debate in a loop starting from roundsCompleted+1,
+      //      passing the runId and recovered context, until unanimous or
+      //      maxRounds is exceeded.
+      //
+      // The tool runs to completion autonomously — the user gets the same
+      // result as if the debate had never been interrupted.
+      // ---------------------------------------------------------------------
+      swarm_resume: tool({
+        description:
+          "Resume an interrupted Swarm Plan debate from where it stopped. " +
+          "Reads the last completed round from the run's debate log and " +
+          "continues the debate to completion. " +
+          "Use swarm_status to find the runId of the interrupted run.",
+        args: {
+          runId: tool.schema
+            .string()
+            .describe(
+              "The run ID of the interrupted plan debate to resume. " +
+                "Find it with swarm_status.",
+            ),
+        },
+        async execute(args, ctx) {
+          const dir = ctx.directory;
+          const { runId } = args;
+          ctx.metadata({ title: `Swarm Resume — ${runId}` });
+
+          // -- Read run meta ------------------------------------------------
+          const runDir = join(dir, ".swarm/output/runs", runId, "plan");
+          let meta;
+          try {
+            meta = JSON.parse(
+              await readFile(join(runDir, "meta.json"), "utf8"),
+            );
+          } catch {
+            return JSON.stringify({
+              error:
+                `No plan run found with ID "${runId}". ` +
+                "Use swarm_status to list available runs.",
+            });
+          }
+
+          // -- Guard: already finished --------------------------------------
+          if (meta.outcome === "consensus") {
+            return JSON.stringify({
+              alreadyComplete: true,
+              runId,
+              message:
+                `Run "${runId}" already reached consensus after ` +
+                `${meta.roundsCompleted} round(s). ` +
+                `Consensus is at .swarm/output/runs/${runId}/plan/consensus.md`,
+            });
+          }
+          if (meta.outcome === "escalated") {
+            return JSON.stringify({
+              alreadyComplete: true,
+              runId,
+              message:
+                `Run "${runId}" was already escalated after ` +
+                `${meta.roundsCompleted} round(s) — human decision required. ` +
+                `Review .swarm/output/runs/${runId}/plan/debate_log.md`,
+            });
+          }
+
+          const roundsCompleted = meta.roundsCompleted ?? 0;
+          const maxRounds = meta.maxRounds ?? 5;
+          const brief = meta.brief;
+
+          if (!brief) {
+            return JSON.stringify({
+              error:
+                `Run "${runId}" meta.json is missing the "brief" field — ` +
+                "cannot resume without knowing the original project brief.",
+            });
+          }
+
+          // -- Recover context from last completed round --------------------
+          const logContent = await readProjectFile(
+            dir,
+            `output/runs/${runId}/plan/debate_log.md`,
+          );
+
+          let recoveredContext = null;
+
+          if (roundsCompleted > 0) {
+            recoveredContext = extractLastCompressedContext(logContent);
+            if (!recoveredContext) {
+              // Fallback: if the compressed context block is missing (old log
+              // format or truncated file), synthesise a minimal context note.
+              recoveredContext =
+                `Resuming from round ${roundsCompleted}. ` +
+                "No compressed context was found in the debate log — " +
+                "please re-examine the project brief and produce fresh plans.";
+            }
+          }
+
+          // -- Validate mode file is still intact ---------------------------
+          const modeContent = await readProjectFile(dir, ".swarm/plan.md");
+          if (!modeContent) {
+            return JSON.stringify({
+              error:
+                "No .swarm/plan.md found. " +
+                "The mode configuration file is required to resume.",
+            });
+          }
+
+          const fm = parseFrontmatter(modeContent);
+          const rawAgents = Array.isArray(fm.agents) ? fm.agents : [];
+          const compressTemplate =
+            extractSection(modeContent, "Compress Prompt") || null;
+          const produceTemplate = extractSection(modeContent, "Produce Prompt");
+          const crossReviewTemplate = extractSection(
+            modeContent,
+            "Cross-Review Prompt",
+          );
+
+          if (!produceTemplate || !crossReviewTemplate) {
+            return JSON.stringify({
+              error:
+                "plan.md is missing required sections " +
+                "(## Produce Prompt and/or ## Cross-Review Prompt).",
+            });
+          }
+
+          const agents = [];
+          for (const rawName of rawAgents) {
+            const agent = await loadAgent(dir, String(rawName));
+            if (agent) agents.push(agent);
+          }
+          if (agents.length === 0) {
+            return JSON.stringify({
+              error: "No agent files could be loaded from plan.md.",
+            });
+          }
+
+          // -- Resume loop --------------------------------------------------
+          let currentRound = roundsCompleted + 1;
+          let currentContext = recoveredContext;
+          let finalResult = null;
+
+          ctx.metadata({
+            title: `Swarm Resume — ${runId} from round ${currentRound}`,
+          });
+
+          while (currentRound <= maxRounds) {
+            ctx.metadata({
+              title: `Swarm Resume — ${runId} R${currentRound}`,
+            });
+
+            // --- Phase 1: Produce ---
+            const agentOutputs = {};
+            const selfVotes = {};
+
+            for (const agent of agents) {
+              const prompt = fillTemplate(produceTemplate, {
+                round: String(currentRound),
+                brief,
+                context:
+                  currentContext ??
+                  "This is the first round — no prior context.",
+              });
+              try {
+                const output = await runSession(
+                  client,
+                  dir,
+                  `Swarm Plan R${currentRound} — ${agent.name} [resumed]`,
+                  agent.systemPrompt,
+                  prompt,
+                );
+                agentOutputs[agent.name] = output;
+                selfVotes[agent.name] = detectVote(output);
+              } catch (err) {
+                console.error(
+                  `[swarm_resume] Phase 1 error (${agent.name}): ${err.message}`,
+                );
+                agentOutputs[agent.name] = `[ERROR: ${err.message}]`;
+                selfVotes[agent.name] = "REVISE";
+              }
+            }
+
+            // --- Phase 2: Cross-review ---
+            const crossVotes = {};
+            for (const reviewer of agents) {
+              crossVotes[reviewer.name] = {};
+              for (const reviewed of agents) {
+                if (reviewer.name === reviewed.name) continue;
+                const prompt = fillTemplate(crossReviewTemplate, {
+                  agent_name: reviewed.name,
+                  agent_output: agentOutputs[reviewed.name] ?? "(no output)",
+                });
+                try {
+                  const reviewText = await runSession(
+                    client,
+                    dir,
+                    `Swarm Cross-Review R${currentRound} — ${reviewer.name} → ${reviewed.name} [resumed]`,
+                    reviewer.systemPrompt,
+                    prompt,
+                  );
+                  crossVotes[reviewer.name][reviewed.name] =
+                    detectVote(reviewText);
+                } catch (err) {
+                  console.error(
+                    `[swarm_resume] Phase 2 error (${reviewer.name} → ${reviewed.name}): ${err.message}`,
+                  );
+                  crossVotes[reviewer.name][reviewed.name] = "REVISE";
+                }
+              }
+            }
+
+            // --- Tally ---
+            const allSelfVotes = Object.values(selfVotes);
+            const allCrossVotes = Object.values(crossVotes).flatMap((v) =>
+              Object.values(v),
+            );
+            const allVotes = [...allSelfVotes, ...allCrossVotes];
+            const unanimous =
+              allVotes.length > 0 && allVotes.every((v) => v === "APPROVE");
+
+            // --- Phase 3: Compress ---
+            const compressedContext = await compressContext(
+              client,
+              dir,
+              currentRound,
+              agents,
+              agentOutputs,
+              selfVotes,
+              crossVotes,
+              compressTemplate,
+            );
+
+            // --- Write to run directory ---
+            const ensuredRunDir = await ensureRunDir(dir, runId, "plan");
+
+            const logEntry = [
+              `## Round ${currentRound} [resumed]`,
+              ``,
+              `### Phase 1 — Agent Outputs & Self-Votes`,
+              ``,
+              ...agents.map(
+                (a) =>
+                  `#### ${a.name} — self-vote: **${selfVotes[a.name]}**\n\n` +
+                  (agentOutputs[a.name] ?? "(no output)") +
+                  `\n`,
+              ),
+              `### Phase 2 — Cross-Review Votes`,
+              ``,
+              "```json",
+              JSON.stringify(crossVotes, null, 2),
+              "```",
+              ``,
+              `### Phase 3 — Compressed Context`,
+              ``,
+              compressedContext,
+              ``,
+              `### Result`,
+              ``,
+              `Self-votes: ${JSON.stringify(selfVotes)}`,
+              `All unanimous: **${unanimous}**`,
+              ``,
+            ].join("\n");
+
+            const runLogPath = join(ensuredRunDir, "debate_log.md");
+            await appendLog(runLogPath, "Debate Log", logEntry);
+
+            const consensusRunPath = join(ensuredRunDir, "consensus.md");
+            if (unanimous) {
+              const lines = [
+                `# Consensus Plan`,
+                ``,
+                `> Run: ${runId}`,
+                `> Resumed. Unanimous agreement reached after ${currentRound} round(s).`,
+                ``,
+                `## Project Brief`,
+                ``,
+                brief,
+                ``,
+              ];
+              for (const agent of agents) {
+                lines.push(
+                  `## ${agent.name}`,
+                  ``,
+                  agentOutputs[agent.name] ?? "",
+                  ``,
+                );
+              }
+              await writeFile(consensusRunPath, lines.join("\n"), "utf8");
+            }
+
+            await writeMeta(ensuredRunDir, {
+              roundsCompleted: currentRound,
+              outcome: unanimous ? "consensus" : "in_progress",
+              selfVotes,
+              updatedAt: new Date().toISOString(),
+            });
+
+            await publishCurrent(runLogPath, dir, "output/plan/debate_log.md");
+            if (unanimous) {
+              await publishCurrent(
+                consensusRunPath,
+                dir,
+                "output/plan/consensus.md",
+              );
+            }
+
+            if (unanimous) {
+              finalResult = {
+                runId,
+                unanimous: true,
+                roundsCompleted: currentRound,
+                message:
+                  `All agents agreed after round ${currentRound}. ` +
+                  `Run ID: ${runId}. ` +
+                  `Consensus written to .swarm/output/runs/${runId}/plan/consensus.md ` +
+                  `and .swarm/output/plan/consensus.md`,
+              };
+              break;
+            }
+
+            currentContext = compressedContext;
+            currentRound++;
+          }
+
+          // maxRounds exceeded without consensus
+          if (!finalResult) {
+            const ensuredRunDir = await ensureRunDir(dir, runId, "plan");
+            await writeMeta(ensuredRunDir, {
+              outcome: "escalated",
+              roundsCompleted: maxRounds,
+              updatedAt: new Date().toISOString(),
+            });
+            finalResult = {
+              runId,
+              unanimous: false,
+              escalate: true,
+              roundsCompleted: maxRounds,
+              message:
+                `Reached the maximum of ${maxRounds} rounds without unanimous agreement. ` +
+                `Review .swarm/output/runs/${runId}/plan/debate_log.md and decide.`,
+            };
+          }
+
+          return JSON.stringify(finalResult);
         },
       }),
     },
